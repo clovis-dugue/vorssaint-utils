@@ -15,6 +15,7 @@ cd vorssaint-utils
 ./build.sh                         # build and assemble the bundle
 ./build/Vorssaint --selftest       # quick health check (SELFTEST OK)
 ./build.sh --install               # install into /Applications and launch
+./build.sh --fast                  # dev loop: incremental debug build, relaunched
 ```
 
 You need macOS 14 or newer, Apple Silicon and the Xcode Command Line Tools. The
@@ -24,6 +25,17 @@ SwiftPM aware editors can index the code.
 
 Hitting a build or permission snag while developing? See the
 [troubleshooting guide](docs/TROUBLESHOOTING.md).
+
+### Fast development loop
+
+`./build.sh --fast` compiles a debug build through SwiftPM, so after the first
+run only the files a change touches are recompiled, then refreshes a cached
+"Vorssaint (Developer)" bundle under `~/Library/Caches/vorssaint-dev` and
+relaunches it. A one file change lands in the running app in a few seconds,
+against minutes for a full release build. The Developer variant keeps its own
+bundle id, permissions and preferences, so it runs next to the installed app.
+Pair it with the stable signing identity below; with ad hoc signing macOS asks
+for the granted permissions again after every rebuild.
 
 ### Stable signing (optional)
 

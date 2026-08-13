@@ -11,17 +11,23 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Flags: --dev builds the local-only "Vorssaint (Developer)" variant (its own
-# bundle id, so it coexists with the official app); --install puts it in /Applications.
+# bundle id, so it coexists with the official app); --install puts it in /Applications;
+# --test compiles and runs the unit tests; --fast is the development loop: an
+# incremental debug build of the Developer variant, refreshed into a cached
+# bundle and relaunched (implies --dev).
 DEV=0
 INSTALL=0
 TEST=0
+FAST=0
 for arg in "$@"; do
     case "$arg" in
         --dev)     DEV=1 ;;
         --install) INSTALL=1 ;;
         --test)    TEST=1 ;;
+        --fast)    FAST=1 ;;
     esac
 done
+(( FAST )) && DEV=1
 
 if (( DEV )); then
     APP_NAME="Vorssaint (Developer)"
@@ -95,6 +101,225 @@ SDK_COMPAT_FLAGS=()
 if [[ "$SDK" == "$PINNED_SDK" ]]; then
     # Swift 6.4 can read the SDK 26 interfaces when given their compiler version.
     SDK_COMPAT_FLAGS=(-Xfrontend -interface-compiler-version -Xfrontend 6.3.2)
+fi
+
+# Signing, in order of preference:
+#   1. Developer ID Application — the real, Apple-issued identity used for
+#      notarized releases. Signed with the hardened runtime (required for
+#      notarization), the app's entitlements and a secure timestamp. Gives a
+#      stable, team-based designated requirement, so permissions persist across
+#      updates AND Gatekeeper shows no "unverified developer" warning.
+#   2. "Vorssaint Utils Signing" — the legacy stable self-signed identity, kept
+#      as a fallback so contributors without a Developer ID still get a constant
+#      designated requirement across their local builds.
+#   3. Ad-hoc — fresh clone with no identity at all.
+DEVID="$(developer_id_identity)"
+codesign_with_timestamp_retry() {
+    local attempt
+    for attempt in 1 2 3; do
+        if codesign "$@"; then
+            return 0
+        fi
+        if (( attempt < 3 )); then
+            echo "  Developer ID signing failed; retrying ($((attempt + 1))/3)"
+            sleep "$attempt"
+        fi
+    done
+    return 1
+}
+
+codesign_app() {
+    local target="$1"
+    if [[ -n "$DEVID" ]]; then
+        codesign_with_timestamp_retry --force --strip-disallowed-xattrs --options runtime --timestamp \
+            --entitlements "$ENTITLEMENTS" --sign "$DEVID" "$target"
+    elif security find-identity -p codesigning 2>/dev/null | grep -q "$LEGACY_IDENTITY"; then
+        codesign --force --strip-disallowed-xattrs --sign "$LEGACY_IDENTITY" "$target"
+    else
+        codesign --force --strip-disallowed-xattrs --sign - "$target"
+    fi
+}
+
+codesign_fan_helper() {
+    local target="$1"
+    if [[ -n "$DEVID" ]]; then
+        codesign_with_timestamp_retry --force --strip-disallowed-xattrs --options runtime --timestamp \
+            --identifier "$FAN_HELPER_ID" --sign "$DEVID" "$target"
+    elif security find-identity -p codesigning 2>/dev/null | grep -q "$LEGACY_IDENTITY"; then
+        codesign --force --strip-disallowed-xattrs --identifier "$FAN_HELPER_ID" \
+            --sign "$LEGACY_IDENTITY" "$target"
+    else
+        codesign --force --strip-disallowed-xattrs --identifier "$FAN_HELPER_ID" --sign - "$target"
+    fi
+}
+
+sign_bundle() {
+    local bundle="$1"
+    local executable="$bundle/Contents/MacOS/$EXECUTABLE"
+    local helper="$bundle/Contents/Library/LaunchServices/$FAN_HELPER_ID"
+
+    if [[ -n "$DEVID" ]]; then
+        echo "  signing with Developer ID (hardened runtime): $DEVID"
+    elif security find-identity -p codesigning 2>/dev/null | grep -q "$LEGACY_IDENTITY"; then
+        echo "  signing with legacy self-signed identity: $LEGACY_IDENTITY"
+    else
+        echo "  signing ad-hoc (no identity installed — run Tools/setup-signing.sh)"
+    fi
+    [[ -f "$helper" ]] && codesign_fan_helper "$helper"
+    codesign_app "$bundle"
+
+    # If local filesystem metadata invalidates the first signature, sign once
+    # more. The installed Developer bundle is signed again after the final copy.
+    if ! codesign --verify --deep --strict "$bundle" >/dev/null 2>&1; then
+        echo "  re-signing after filesystem metadata settled"
+        xattr -c -r "$bundle" 2>/dev/null || true
+        [[ -f "$helper" ]] && codesign_fan_helper "$helper"
+        codesign_app "$bundle"
+    fi
+    [[ -f "$executable" ]] && codesign --verify --strict "$executable"
+    [[ -f "$helper" ]] && codesign --verify --strict "$helper"
+    codesign --verify --deep --strict "$bundle"
+}
+
+process_is_running() {
+    local proc="$1"
+    if (( ${#proc} > 15 )); then
+        pgrep -f "/Contents/MacOS/$proc" >/dev/null 2>&1
+    else
+        pgrep -x "$proc" >/dev/null 2>&1
+    fi
+}
+
+stop_process() {
+    local proc="$1"
+    if (( ${#proc} > 15 )); then
+        pkill -f "/Contents/MacOS/$proc" 2>/dev/null || true
+    else
+        pkill -x "$proc" 2>/dev/null || true
+    fi
+    for _ in {1..50}; do
+        if ! process_is_running "$proc"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "✗ $proc is still running — quit it and retry" >&2
+    return 1
+}
+
+# Rewrites a freshly copied Info.plist and fan daemon plist for the Developer
+# variant: a distinct identity so the Developer build installs and runs next to
+# the official app, with its own permissions, preferences and login item.
+apply_dev_variant_plists() {
+    local contents="$1"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.vorssaint.utils.dev" "$contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleName Vorssaint (Developer)" "$contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Vorssaint (Developer)" "$contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $EXECUTABLE" "$contents/Info.plist"
+    local fan_plist="$contents/Library/LaunchDaemons/$FAN_HELPER_ID.plist"
+    /usr/libexec/PlistBuddy -c "Set :Label $FAN_HELPER_ID" "$fan_plist"
+    /usr/libexec/PlistBuddy -c "Set :BundleProgram Contents/Library/LaunchServices/$FAN_HELPER_ID" "$fan_plist"
+    /usr/libexec/PlistBuddy -c "Delete :MachServices:com.vorssaint.utils.fan-control" "$fan_plist"
+    /usr/libexec/PlistBuddy -c "Add :MachServices:$FAN_HELPER_ID bool true" "$fan_plist"
+}
+
+# Stamp the source commit + build time so the running dev app shows (in About)
+# exactly which code it was compiled from. Lets you verify it matches HEAD before
+# testing, instead of unknowingly running a stale build. Dev-only; never shipped.
+stamp_build_commit() {
+    local plist="$1"
+    local sha stamp
+    sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    [[ -n "$(git status --porcelain 2>/dev/null)" ]] && sha="$sha-dirty"
+    stamp="$sha · $(date '+%Y-%m-%d %H:%M')"
+    /usr/libexec/PlistBuddy -c "Set :VorssaintBuildCommit '$stamp'" "$plist" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :VorssaintBuildCommit string '$stamp'" "$plist"
+    echo "  stamped dev build: $sha"
+}
+
+# --fast: the development loop. Compiles a debug build through SwiftPM, whose
+# persistent cache in .build recompiles only the files a change touches, then
+# refreshes a cached "Vorssaint (Developer)" bundle and relaunches it. The
+# bundle lives under ~/Library/Caches: staging it inside ~/Documents would pick
+# up File Provider xattrs that invalidate the signature (see header note).
+if (( FAST )); then
+    SPM_FLAGS=(-c debug -Xswiftc -DVORSSAINT_DEVELOPMENT)
+    if [[ "$SDK" == "$PINNED_SDK" ]]; then
+        SPM_FLAGS+=(-Xswiftc -sdk -Xswiftc "$SDK")
+        for flag in "${SDK_COMPAT_FLAGS[@]}"; do
+            SPM_FLAGS+=(-Xswiftc "$flag")
+        done
+    fi
+    echo "▸ Compiling (incremental debug) against $(basename "$SDK")…"
+    swift build "${SPM_FLAGS[@]}"
+    BIN_DIR="$(swift build "${SPM_FLAGS[@]}" --show-bin-path)"
+
+    FAST_ROOT="$HOME/Library/Caches/vorssaint-dev"
+    BUNDLE="$FAST_ROOT/$APP_NAME.app"
+    HELPER_DEST="$BUNDLE/Contents/Library/LaunchServices/$FAN_HELPER_ID"
+
+    if [[ ! -d "$BUNDLE" ]]; then
+        echo "▸ Assembling dev bundle (first fast run)…"
+        mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources" \
+            "$BUNDLE/Contents/Library/LaunchDaemons" "$BUNDLE/Contents/Library/LaunchServices"
+        cp Resources/Info.plist "$BUNDLE/Contents/Info.plist"
+        cp Resources/com.vorssaint.utils.fan-control.plist \
+            "$BUNDLE/Contents/Library/LaunchDaemons/$FAN_HELPER_ID.plist"
+        printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
+        apply_dev_variant_plists "$BUNDLE/Contents"
+        echo "▸ Generating app icon…"
+        swift Tools/MakeIcon.swift "$FAST_ROOT/AppIcon.iconset"
+        cp "$FAST_ROOT/AppIcon.icns" "$BUNDLE/Contents/Resources/AppIcon.icns"
+        cp "$FAST_ROOT/MenuBarIcon.png" "$FAST_ROOT/MenuBarIcon@2x.png" \
+            "$FAST_ROOT/BrandMark.png" "$BUNDLE/Contents/Resources/"
+    fi
+
+    # Refresh the resources a change may have touched; cheap when nothing did.
+    cp CHANGELOG.md "$BUNDLE/Contents/Resources/CHANGELOG.md"
+    for lproj in Resources/*.lproj(N); do
+        rsync -a "$lproj" "$BUNDLE/Contents/Resources/"
+    done
+    if [[ -d Resources/Gifs ]]; then
+        rsync -a Resources/Gifs/ "$BUNDLE/Contents/Resources/Gifs/"
+    fi
+    if [[ -d Resources/Images ]]; then
+        rsync -a Resources/Images/ "$BUNDLE/Contents/Resources/Images/"
+    fi
+
+    # The fan helper changes rarely; rebuild it only when its sources did.
+    FAN_HELPER_SOURCES=(
+        Sources/Vorssaint/Services/FanControl/FanControlSupport.swift
+        Sources/Vorssaint/Services/FanControl/FanControlXPC.swift
+        Sources/Vorssaint/Services/SystemMonitor/SMCClient.swift
+        Sources/Vorssaint/Services/FanControl/FanControlHardware.swift
+        Sources/FanControlHelper/main.swift
+    )
+    if [[ ! -f "$HELPER_DEST" ]] \
+        || [[ -n "$(find "${FAN_HELPER_SOURCES[@]}" -newer "$HELPER_DEST" 2>/dev/null | head -1)" ]]; then
+        echo "▸ Compiling protected fan helper…"
+        swiftc -Onone -target "$TARGET" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" "${BUILD_VARIANT_FLAGS[@]}" \
+            "${FAN_HELPER_SOURCES[@]}" -o "$HELPER_DEST"
+        "$HELPER_DEST" --selftest
+    fi
+    FAN_HELPER_VERSION="$(/usr/bin/shasum -a 256 \
+        "$HELPER_DEST" \
+        "$BUNDLE/Contents/Library/LaunchDaemons/$FAN_HELPER_ID.plist" \
+        | /usr/bin/awk '{print $1}' | /usr/bin/shasum -a 256 \
+        | /usr/bin/awk '{print $1}')"
+    /usr/libexec/PlistBuddy -c "Set :VorssaintFanControlHelperVersion '$FAN_HELPER_VERSION'" \
+        "$BUNDLE/Contents/Info.plist" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :VorssaintFanControlHelperVersion string '$FAN_HELPER_VERSION'" \
+            "$BUNDLE/Contents/Info.plist"
+
+    cp "$BIN_DIR/Vorssaint" "$BUNDLE/Contents/MacOS/$EXECUTABLE"
+    stamp_build_commit "$BUNDLE/Contents/Info.plist"
+    xattr -c -r "$BUNDLE" 2>/dev/null || true
+    echo "▸ Signing…"
+    sign_bundle "$BUNDLE"
+    stop_process "$EXECUTABLE"
+    open "$BUNDLE"
+    echo "✓ Fast build running (${SECONDS}s): $BUNDLE"
+    exit 0
 fi
 
 # --test: compile and run the standalone unit tests (pure helpers only: metrics,
@@ -272,24 +497,8 @@ for lproj in Resources/*.lproj(N); do
     cp -R "$lproj" "$STAGE/Contents/Resources/"
 done
 if (( DEV )); then
-    # A distinct identity so the Developer build installs and runs next to the
-    # official app, with its own permissions, preferences and login item.
-    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.vorssaint.utils.dev" "$STAGE/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleName Vorssaint (Developer)" "$STAGE/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Vorssaint (Developer)" "$STAGE/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $EXECUTABLE" "$STAGE/Contents/Info.plist"
-    FAN_PLIST="$STAGE/Contents/Library/LaunchDaemons/$FAN_HELPER_ID.plist"
-    /usr/libexec/PlistBuddy -c "Set :Label $FAN_HELPER_ID" "$FAN_PLIST"
-    /usr/libexec/PlistBuddy -c "Set :BundleProgram Contents/Library/LaunchServices/$FAN_HELPER_ID" "$FAN_PLIST"
-    /usr/libexec/PlistBuddy -c "Delete :MachServices:com.vorssaint.utils.fan-control" "$FAN_PLIST"
-    /usr/libexec/PlistBuddy -c "Add :MachServices:$FAN_HELPER_ID bool true" "$FAN_PLIST"
-    # Stamp the source commit + build time so the running dev app shows (in About)
-    # exactly which code it was compiled from. Lets you verify it matches HEAD before
-    # testing, instead of unknowingly running a stale build. Dev-only; never shipped.
-    SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    [[ -n "$(git status --porcelain 2>/dev/null)" ]] && SHA="$SHA-dirty"
-    /usr/libexec/PlistBuddy -c "Add :VorssaintBuildCommit string '$SHA · $(date '+%Y-%m-%d %H:%M')'" "$STAGE/Contents/Info.plist"
-    echo "  stamped dev build: $SHA"
+    apply_dev_variant_plists "$STAGE/Contents"
+    stamp_build_commit "$STAGE/Contents/Info.plist"
 fi
 FAN_HELPER_VERSION="$(/usr/bin/shasum -a 256 \
     "$STAGE/Contents/Library/LaunchServices/$FAN_HELPER_ID" \
@@ -311,84 +520,6 @@ if [[ -d Resources/Images ]]; then
 fi
 xattr -c -r "$STAGE" 2>/dev/null || true
 
-# Signing, in order of preference:
-#   1. Developer ID Application — the real, Apple-issued identity used for
-#      notarized releases. Signed with the hardened runtime (required for
-#      notarization), the app's entitlements and a secure timestamp. Gives a
-#      stable, team-based designated requirement, so permissions persist across
-#      updates AND Gatekeeper shows no "unverified developer" warning.
-#   2. "Vorssaint Utils Signing" — the legacy stable self-signed identity, kept
-#      as a fallback so contributors without a Developer ID still get a constant
-#      designated requirement across their local builds.
-#   3. Ad-hoc — fresh clone with no identity at all.
-DEVID="$(developer_id_identity)"
-codesign_with_timestamp_retry() {
-    local attempt
-    for attempt in 1 2 3; do
-        if codesign "$@"; then
-            return 0
-        fi
-        if (( attempt < 3 )); then
-            echo "  Developer ID signing failed; retrying ($((attempt + 1))/3)"
-            sleep "$attempt"
-        fi
-    done
-    return 1
-}
-
-codesign_app() {
-    local target="$1"
-    if [[ -n "$DEVID" ]]; then
-        codesign_with_timestamp_retry --force --strip-disallowed-xattrs --options runtime --timestamp \
-            --entitlements "$ENTITLEMENTS" --sign "$DEVID" "$target"
-    elif security find-identity -p codesigning 2>/dev/null | grep -q "$LEGACY_IDENTITY"; then
-        codesign --force --strip-disallowed-xattrs --sign "$LEGACY_IDENTITY" "$target"
-    else
-        codesign --force --strip-disallowed-xattrs --sign - "$target"
-    fi
-}
-
-codesign_fan_helper() {
-    local target="$1"
-    if [[ -n "$DEVID" ]]; then
-        codesign_with_timestamp_retry --force --strip-disallowed-xattrs --options runtime --timestamp \
-            --identifier "$FAN_HELPER_ID" --sign "$DEVID" "$target"
-    elif security find-identity -p codesigning 2>/dev/null | grep -q "$LEGACY_IDENTITY"; then
-        codesign --force --strip-disallowed-xattrs --identifier "$FAN_HELPER_ID" \
-            --sign "$LEGACY_IDENTITY" "$target"
-    else
-        codesign --force --strip-disallowed-xattrs --identifier "$FAN_HELPER_ID" --sign - "$target"
-    fi
-}
-
-sign_bundle() {
-    local bundle="$1"
-    local executable="$bundle/Contents/MacOS/$EXECUTABLE"
-    local helper="$bundle/Contents/Library/LaunchServices/$FAN_HELPER_ID"
-
-    if [[ -n "$DEVID" ]]; then
-        echo "  signing with Developer ID (hardened runtime): $DEVID"
-    elif security find-identity -p codesigning 2>/dev/null | grep -q "$LEGACY_IDENTITY"; then
-        echo "  signing with legacy self-signed identity: $LEGACY_IDENTITY"
-    else
-        echo "  signing ad-hoc (no identity installed — run Tools/setup-signing.sh)"
-    fi
-    [[ -f "$helper" ]] && codesign_fan_helper "$helper"
-    codesign_app "$bundle"
-
-    # If local filesystem metadata invalidates the first signature, sign once
-    # more. The installed Developer bundle is signed again after the final copy.
-    if ! codesign --verify --deep --strict "$bundle" >/dev/null 2>&1; then
-        echo "  re-signing after filesystem metadata settled"
-        xattr -c -r "$bundle" 2>/dev/null || true
-        [[ -f "$helper" ]] && codesign_fan_helper "$helper"
-        codesign_app "$bundle"
-    fi
-    [[ -f "$executable" ]] && codesign --verify --strict "$executable"
-    [[ -f "$helper" ]] && codesign --verify --strict "$helper"
-    codesign --verify --deep --strict "$bundle"
-}
-
 sign_installed_bundle() {
     local bundle="$1"
     wait_for_install_metadata "$bundle"
@@ -396,32 +527,6 @@ sign_installed_bundle() {
 }
 
 sign_bundle "$STAGE"
-
-process_is_running() {
-    local proc="$1"
-    if (( ${#proc} > 15 )); then
-        pgrep -f "/Contents/MacOS/$proc" >/dev/null 2>&1
-    else
-        pgrep -x "$proc" >/dev/null 2>&1
-    fi
-}
-
-stop_process() {
-    local proc="$1"
-    if (( ${#proc} > 15 )); then
-        pkill -f "/Contents/MacOS/$proc" 2>/dev/null || true
-    else
-        pkill -x "$proc" 2>/dev/null || true
-    fi
-    for _ in {1..50}; do
-        if ! process_is_running "$proc"; then
-            return 0
-        fi
-        sleep 0.1
-    done
-    echo "✗ $proc is still running — quit it and retry" >&2
-    return 1
-}
 
 wait_for_install_metadata() {
     local bundle="$1"
